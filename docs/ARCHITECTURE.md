@@ -21,7 +21,7 @@ main.py ── QApplication, logging, wiring
 2. `SyncEngine._event` drops the event when:
    - the pair is not being watched,
    - a full mirror is running for that pair, or
-   - the path was written by the engine itself less than 1 second ago (echo suppression).
+   - it is an *echo* of the engine's own write (see below).
 3. Events are **debounced** per path for 0.65 s, so a burst of writes becomes one copy.
 4. The work runs on a 4-thread `ThreadPoolExecutor`. `FolderPair.source_for(side)` decides the direction, and returns `None` when the pair's mode ignores that side.
 5. The operation is applied:
@@ -32,10 +32,10 @@ main.py ── QApplication, logging, wiring
 
 ## Why there are no sync loops
 
-Every write the engine makes produces an event on the other side. Two mechanisms stop that from bouncing back:
+Every write the engine makes produces events on the other side, and on Windows they arrive about a second later. Two mechanisms stop them from bouncing back:
 
-- The written path is put on a short ignore list before the write starts and again after it finishes.
-- Even if an echo gets through, the file on both sides now has the same size and mtime (`copy2` keeps the mtime), so the copy is skipped.
+- **Echo signatures.** Before a write, the target path is marked *pending*, and every event on it is ignored. Afterwards the engine records what the write left on disk: absent, a folder, or `(size, mtime_ns)`. For 5 seconds, an event on that path is treated as an echo only while the path still matches that record. If the user changes the file in the meantime, the record no longer matches, so the change is synced and never swallowed.
+- **Identical-file check.** Even if an echo gets through, both sides now have the same size and mtime (`copy2` keeps the mtime), so the copy is skipped.
 
 ## Locked files
 

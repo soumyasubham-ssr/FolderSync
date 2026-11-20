@@ -14,7 +14,7 @@ from models import FolderPair, PairStatus, SyncMode
 from watcher import FolderWatcher
 
 DEBOUNCE_SECONDS = 0.65     # coalesce bursts of events for the same path
-SUPPRESS_SECONDS = 1.0      # skip echo events caused by our own writes (they are no-ops anyway)
+ECHO_WINDOW_SECONDS = 5.0   # how long events on a path we just wrote are checked for being our own echo
 COPY_RETRIES = 4
 LOCKED_WINERRORS = (32, 33)  # sharing / lock violation
 LIVE_MTIME_TOLERANCE = 0.01
@@ -27,6 +27,18 @@ def _is_locked(error: OSError) -> bool:
 
 def _key(path: os.PathLike | str) -> str:
     return os.path.normcase(os.fspath(path))
+
+
+_PENDING = object()  # a write is in progress: every event on the path is ours
+
+
+def _signature(path: os.PathLike | str):
+    """What a path looks like on disk: ``None`` (absent), ``"dir"``, or ``(size, mtime_ns)``."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return "dir" if os.path.isdir(path) else (st.st_size, st.st_mtime_ns)
 
 
 def _unchanged(source: Path, target: Path, tolerance: float) -> bool:
@@ -47,7 +59,8 @@ class SyncEngine(QObject):
         self._pairs: dict[int, FolderPair] = {}
         self._watchers: dict[int, FolderWatcher] = {}
         self._timers: dict[tuple[int, str], threading.Timer] = {}
-        self._ignore: dict[str, float] = {}
+        # path -> (expiry, on-disk signature our own write left behind)
+        self._echoes: dict[str, tuple[float, object]] = {}
         self._initial_running: set[int] = set()
         self._lock = threading.RLock()
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="FolderSync")
@@ -123,11 +136,10 @@ class SyncEngine(QObject):
     # Live events ------------------------------------------------------------
     def _event(self, pair_id, side, kind, source, destination, is_dir) -> None:
         source_key = _key(source)
-        now = time.monotonic()
         with self._lock:
             if pair_id not in self._watchers or pair_id in self._initial_running:
                 return
-            if self._ignore.get(source_key, 0) > now:
+            if self._is_echo(source_key, source):
                 return
             key = (pair_id, source_key)
             if previous := self._timers.pop(key, None):
@@ -178,9 +190,12 @@ class SyncEngine(QObject):
             return
         if old_target.exists() and not new_target.exists():
             # Rename in place instead of delete + full re-copy.
-            self._suppress(old_target, new_target)
+            self._expect(old_target, new_target)
             new_target.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(old_target, new_target)
+            try:
+                os.replace(old_target, new_target)
+            finally:
+                self._settle(old_target, new_target)
             self.log.log(pair.name, f"Renamed {old_target.name} → {new_target.name}")
         else:
             self._remove(old_target, pair)
@@ -197,23 +212,28 @@ class SyncEngine(QObject):
         if is_dir:
             if target.is_dir():
                 return False
-            self._suppress(target)
-            target.mkdir(parents=True, exist_ok=True)
+            self._expect(target)
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            finally:
+                self._settle(target)
             self.log.log(pair.name, f"Created folder {source.name}")
             return True
         if _unchanged(source, target, tolerance):
             return False
-        self._suppress(target)
         target.parent.mkdir(parents=True, exist_ok=True)
-        for attempt in range(COPY_RETRIES):
-            try:
-                shutil.copy2(source, target)
-                break
-            except OSError as error:
-                if not _is_locked(error) or attempt == COPY_RETRIES - 1:
-                    raise
-                time.sleep(0.5 * (attempt + 1))
-        self._suppress(target)  # extend the window past the write itself
+        self._expect(target)
+        try:
+            for attempt in range(COPY_RETRIES):
+                try:
+                    shutil.copy2(source, target)
+                    break
+                except OSError as error:
+                    if not _is_locked(error) or attempt == COPY_RETRIES - 1:
+                        raise
+                    time.sleep(0.5 * (attempt + 1))
+        finally:
+            self._settle(target)
         self.log.log(pair.name, f"Copied {source.name}")
         return True
 
@@ -221,20 +241,41 @@ class SyncEngine(QObject):
         # Inspect the target itself: Windows reports deleted folders as files.
         if not os.path.lexists(target):
             return
-        self._suppress(target)
-        if target.is_dir() and not target.is_symlink():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
+        self._expect(target)
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        finally:
+            self._settle(target)
         self.log.log(pair.name, f"Deleted {target.name}")
 
-    def _suppress(self, *paths: Path) -> None:
-        now = time.monotonic()
+    # Echo detection ---------------------------------------------------------
+    # Every write we make raises events on the other side, and on Windows they
+    # arrive about a second later. We remember what each write left on disk;
+    # an event is our own echo only while the path still looks exactly like
+    # that. A real user edit changes the signature, so it is never swallowed.
+    def _expect(self, *paths: Path) -> None:
+        """Mark paths as being written: ignore all their events until ``_settle``."""
         with self._lock:
-            if len(self._ignore) > 1000:  # drop expired entries so the map stays small
-                self._ignore = {k: v for k, v in self._ignore.items() if v > now}
             for path in paths:
-                self._ignore[_key(path)] = now + SUPPRESS_SECONDS
+                self._echoes[_key(path)] = (float("inf"), _PENDING)
+
+    def _settle(self, *paths: Path) -> None:
+        expiry = time.monotonic() + ECHO_WINDOW_SECONDS
+        with self._lock:
+            if len(self._echoes) > 1000:  # drop expired entries so the map stays small
+                now = time.monotonic()
+                self._echoes = {k: v for k, v in self._echoes.items() if v[0] > now}
+            for path in paths:
+                self._echoes[_key(path)] = (expiry, _signature(path))
+
+    def _is_echo(self, key: str, path: str) -> bool:
+        expiry, signature = self._echoes.get(key, (0.0, None))
+        if expiry <= time.monotonic():
+            return False
+        return signature is _PENDING or _signature(path) == signature
 
     # Full mirror ------------------------------------------------------------
     def _initial(self, pair: FolderPair, initial_side: str | None = None) -> None:

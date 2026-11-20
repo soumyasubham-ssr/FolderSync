@@ -3,7 +3,7 @@ import time
 import pytest
 
 from models import FolderPair, SyncMode
-from sync_engine import SyncEngine
+from sync_engine import SyncEngine, _key as engine_key
 
 
 class RecordingLogger:
@@ -73,13 +73,27 @@ def test_live_create_modify_rename_delete(setup):
     assert wait_for(lambda: (right / "note.txt").exists() and (right / "note.txt").read_text() == "v1")
     src.rename(left / "renamed.txt")
     assert wait_for(lambda: (right / "renamed.txt").exists() and not (right / "note.txt").exists())
-    time.sleep(1.2)  # let the echo-suppression window for our own write expire
-    (right / "renamed.txt").write_text("from right")  # bidirectional: right edits flow back
+    (right / "renamed.txt").write_text("from right")  # edit inside the echo window still syncs  # bidirectional: right edits flow back
     assert wait_for(lambda: (left / "renamed.txt").read_text() == "from right")
-    time.sleep(1.2)
     (left / "renamed.txt").unlink()
     assert wait_for(lambda: not (right / "renamed.txt").exists())
     assert not any(status == "Error" for _, status in log.entries)
+    time.sleep(2.5)  # late echo events (Windows delivers them ~1 s later) must not resurrect anything
+    assert sorted(p.name for p in left.iterdir()) == sorted(p.name for p in right.iterdir()) == []
+
+
+def test_echo_is_ignored_but_real_edit_is_not(setup):
+    engine, pair, left, right, log = setup
+    src, dst = left / "a.txt", right / "a.txt"
+    src.write_text("one")
+    engine._copy(src, dst, False, pair)
+    key = str(dst)
+    assert engine._is_echo(engine_key(key), key)          # our own write
+    time.sleep(0.02)
+    dst.write_text("user edit")
+    assert not engine._is_echo(engine_key(key), key)      # a real change on top of it
+    engine._remove(dst, pair)
+    assert engine._is_echo(engine_key(key), key)          # our own delete
 
 
 def test_start_pair_reports_missing_folder(setup, tmp_path):

@@ -20,7 +20,7 @@ All notable changes to this project are documented here. The format follows
 - Editing a pair reset its *Paused* state and *Last Sync* time.
 - Removing a running pair left its watcher running.
 - Deleted folders were removed with `unlink()` because Windows reports them as files.
-- Genuine edits made within 3 s of a sync were silently ignored. Echo suppression now lasts 1 s and is backed by content checks.
+- Genuine edits made within 3 s of a sync were silently ignored. Echo detection now compares each path with what Folder Sync wrote to it, so only its own echoes are skipped.
 - The echo-suppression map grew without limit.
 - *Start Pair* on a disabled pair did nothing and gave no feedback.
 - The About box showed version 1.0.0.
