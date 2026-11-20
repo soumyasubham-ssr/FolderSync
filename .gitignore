@@ -6,3 +6,5 @@ dist/
 *.spec
 folder_sync.db
 FolderSync/
+*.log
+.pytest_cache/

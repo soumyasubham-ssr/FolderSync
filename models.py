@@ -1,6 +1,7 @@
 """Domain models used by the UI, persistence, and synchronization layers."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -13,11 +14,14 @@ class SyncMode(str, Enum):
 
     @property
     def label(self) -> str:
-        return {
-            self.BIDIRECTIONAL: "Bidirectional",
-            self.LEFT_TO_RIGHT: "Left → Right",
-            self.RIGHT_TO_LEFT: "Right → Left",
-        }[self]
+        return _MODE_LABELS[self]
+
+
+_MODE_LABELS = {
+    SyncMode.BIDIRECTIONAL: "Bidirectional",
+    SyncMode.LEFT_TO_RIGHT: "Left → Right",
+    SyncMode.RIGHT_TO_LEFT: "Right → Left",
+}
 
 
 class PairStatus(str, Enum):
@@ -39,10 +43,30 @@ class FolderPair:
     paused: bool = False
     last_sync: str | None = None
 
-    def source_for(self, changed_path: Path, event_side: str) -> tuple[Path, Path] | None:
-        """Return source and target roots, honoring this pair's direction."""
+    @property
+    def status(self) -> PairStatus:
+        if not self.enabled:
+            return PairStatus.DISABLED
+        return PairStatus.PAUSED if self.paused else PairStatus.IDLE
+
+    def validate(self) -> str | None:
+        """Return a user-facing error message, or ``None`` when the pair is usable."""
+        if not (self.name.strip() and self.left_path.strip() and self.right_path.strip()):
+            return "A name and both folders are required."
+        left = os.path.normcase(os.path.abspath(self.left_path))
+        right = os.path.normcase(os.path.abspath(self.right_path))
+        if left == right:
+            return "The left and right folders must be different."
+        if left.startswith(right.rstrip(os.sep) + os.sep) or right.startswith(left.rstrip(os.sep) + os.sep):
+            return "One folder cannot be inside the other; that would sync endlessly."
+        return None
+
+    def source_for(self, event_side: str) -> tuple[Path, Path] | None:
+        """Return ``(source_root, target_root)`` for a change on ``event_side``,
+        or ``None`` when this pair's direction ignores that side."""
         if self.mode is SyncMode.LEFT_TO_RIGHT and event_side != "left":
             return None
         if self.mode is SyncMode.RIGHT_TO_LEFT and event_side != "right":
             return None
-        return (Path(self.left_path), Path(self.right_path)) if event_side == "left" else (Path(self.right_path), Path(self.left_path))
+        left, right = Path(self.left_path), Path(self.right_path)
+        return (left, right) if event_side == "left" else (right, left)

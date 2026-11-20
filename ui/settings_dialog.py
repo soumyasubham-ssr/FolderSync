@@ -6,6 +6,8 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QVBoxLayout
 
+from config import APP_NAME
+
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "FolderSync"
@@ -16,7 +18,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self.settings = db.settings()
-        self.setWindowTitle("Folder Sync Settings")
+        self.setWindowTitle(f"{APP_NAME} Settings")
         self.setMinimumWidth(460)
 
         layout = QVBoxLayout(self)
@@ -42,7 +44,7 @@ class SettingsDialog(QDialog):
         except OSError as error:
             self.db.set_setting("start_with_windows", "0")
             self.windows_start.setChecked(False)
-            self.setWindowTitle(f"Folder Sync Settings — startup could not be updated: {error}")
+            self.setWindowTitle(f"{APP_NAME} Settings — startup could not be updated: {error}")
             return
         self.accept()
 
