@@ -1,9 +1,13 @@
 name: Release
 
-# Push a tag such as v1.1.0 to build the Windows executable and publish a GitHub release.
+# Every push to main builds the Windows executable (downloadable from the run's artifacts).
+# Pushing a tag such as v1.1.0, or publishing a release with a new tag, also attaches it to the release.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -27,7 +31,7 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "dev-" + "${{ github.sha }}".Substring(0, 7) }
           New-Item -ItemType Directory -Force release | Out-Null
           Copy-Item dist/FolderSync.exe "release/FolderSync-$tag-windows-x64.exe"
           Compress-Archive -Path dist/FolderSync.exe, README.md, LICENSE, CHANGELOG.md `
